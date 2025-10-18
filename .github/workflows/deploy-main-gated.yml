@@ -1,0 +1,164 @@
+name: Deploy on main (Gated by Remote Tests)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  actions: write
+  statuses: write
+
+concurrency:
+  group: "pages-deploy"
+  cancel-in-progress: true
+
+jobs:
+  # ===========================
+  # 1️⃣ Remote UI Tests (Gate)
+  # ===========================
+  remote-tests:
+    name: Run remote UI tests before deployment
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Send repository_dispatch to testing repo
+        id: send-remote-tests
+        uses: actions/github-script@v7
+        env:
+          TARGET_OWNER: "avidcutlet"   # 🧩 Your GitHub username
+          TARGET_REPO: "calculator-app-test"  # 🧩 Your test repo
+          APP_UNDER_TEST_URL: "https://avidcutlet.github.io/calculator-app/"
+        with:
+          github-token: ${{ secrets.CI_PAT }}
+          script: |
+            const { TARGET_OWNER, TARGET_REPO, APP_UNDER_TEST_URL } = process.env;
+            const dispatchedAt = new Date().toISOString();
+            const payload = {
+              calc_url: APP_UNDER_TEST_URL,
+              source_repo: `${context.repo.owner}/${context.repo.repo}`,
+              sha: context.sha,
+              ref: context.ref.replace('refs/heads/', '')
+            };
+            await github.rest.repos.createDispatchEvent({
+              owner: TARGET_OWNER,
+              repo: TARGET_REPO,
+              event_type: 'run-tests',
+              client_payload: payload
+            });
+            core.info(`repository_dispatch sent with payload: ${JSON.stringify(payload)}`);
+            core.setOutput('dispatched_at', dispatchedAt);
+
+      - name: Wait for remote testing to complete
+        id: wait-remote-tests
+        uses: actions/github-script@v7
+        env:
+          TARGET_OWNER: "avidcutlet"
+          TARGET_REPO: "calculator-app-test"
+          DISPATCHED_AT: ${{ steps.send-remote-tests.outputs.dispatched_at }}
+        with:
+          github-token: ${{ secrets.CI_PAT }}
+          script: |
+            const { TARGET_OWNER, TARGET_REPO, DISPATCHED_AT } = process.env;
+            const workflow_id = 'on-dispatch-tests.yml';
+            const deadline = Date.now() + 20 * 60 * 1000; // 20 minutes
+            const dispatchedAtMs = Date.parse(DISPATCHED_AT);
+
+            let runId = null, matched = null;
+            while (Date.now() < deadline) {
+              const runs = await github.rest.actions.listWorkflowRuns({
+                owner: TARGET_OWNER,
+                repo: TARGET_REPO,
+                workflow_id,
+                event: 'repository_dispatch',
+                per_page: 20
+              });
+              matched = runs.data.workflow_runs.find(r => Date.parse(r.created_at) >= dispatchedAtMs);
+              if (matched) { runId = matched.id; core.info(`Matched run: ${runId}`); break; }
+              await new Promise(r => setTimeout(r, 5000));
+            }
+            if (!runId) core.setFailed('❌ Could not find the dispatched testing run.');
+
+            let run;
+            while (Date.now() < deadline) {
+              const res = await github.rest.actions.getWorkflowRun({
+                owner: TARGET_OWNER, repo: TARGET_REPO, run_id: runId
+              });
+              run = res.data;
+              core.info(`status=${run.status}, conclusion=${run.conclusion}`);
+              if (run.status === 'completed') break;
+              await new Promise(r => setTimeout(r, 10000));
+            }
+            if (!run) core.setFailed('No run detail fetched.');
+
+            core.setOutput('run_url', run.html_url);
+            core.setOutput('conclusion', run.conclusion || 'unknown');
+            if (run.conclusion !== 'success') {
+              core.setFailed(`🚨 Remote tests failed: ${run.conclusion}`);
+            }
+
+      - name: Set commit status for Remote UI Tests
+        if: ${{ always() }}
+        uses: actions/github-script@v7
+        env:
+          RUN_URL: ${{ steps.wait-remote-tests.outputs.run_url }}
+          CONCLUSION: ${{ steps.wait-remote-tests.outputs.conclusion }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const state = (process.env.CONCLUSION === 'success') ? 'success' : 'failure';
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state,
+              context: 'Remote UI Tests',
+              target_url: process.env.RUN_URL || undefined,
+              description: state === 'success' ? '✅ Remote tests passed' : '❌ Remote tests failed'
+            });
+
+  # ===========================
+  # 2️⃣ Package Static Website
+  # ===========================
+  package-site:
+    name: Package static website for Pages
+    needs: remote-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: src
+
+  # ===========================
+  # 3️⃣ Deploy to Staging (Preview)
+  # ===========================
+  deploy-staging:
+    name: Deploy to GitHub Pages (Staging)
+    needs: package-site
+    runs-on: ubuntu-latest
+    environment: staging
+    outputs:
+      preview_url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages (Staging)
+        id: deploy
+        uses: actions/deploy-pages@v4
+
+  # ===========================
+  # 4️⃣ Deploy to Production
+  # ===========================
+  deploy-production:
+    name: Deploy to GitHub Pages (Production)
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ needs.deploy-staging.outputs.preview_url }}
+    steps:
+      - name: Deploy to GitHub Pages (Production)
+        uses: actions/deploy-pages@v4
